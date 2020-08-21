@@ -61,6 +61,7 @@ struct stun_strings {
 	const char *name;
 };
 
+static int stun_listen_port = 0;
 static char *stun_local = "0.0.0.0";
 static char *stun_server = STUN_SERVER;
 static int stun_port = STUN_PORT;
@@ -497,7 +498,7 @@ int main(int argc, char *argv[])
 	struct hostent *hostinfo;
 	char *value;
 
-	while ((opt = getopt(argc, argv, "t:c:l:dh")) != -1) {
+	while ((opt = getopt(argc, argv, "t:c:l:p:dh")) != -1) {
 		switch (opt) {
 		case 't':
 			stun_rto = atoi(optarg);
@@ -507,6 +508,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'l':
 			stun_local = optarg;
+			break;
+		case 'p':
+			stun_listen_port = atoi(optarg);
 			break;
 		case 'd':
 			stun_debug++;
@@ -533,7 +537,7 @@ int main(int argc, char *argv[])
 
 	bzero(&client, sizeof(client));
 	client.sin_family = AF_INET;
-	client.sin_port = 0;
+	client.sin_port = htons(stun_listen_port);
 	if (inet_aton(stun_local, &client.sin_addr) == 0 ||
 	    bind(sock, (struct sockaddr*) &client, sizeof(client)) < 0) {
 		fprintf(stderr, "Error bind to socket\n");
@@ -558,7 +562,7 @@ int main(int argc, char *argv[])
 	if (res == 0 && mapped.sin_addr.s_addr == INADDR_ANY)
 		res = -1;
 	if (res == 0)
-		printf("%s\n", inet_ntoa(mapped.sin_addr));
+		printf("%s:%d\n", inet_ntoa(mapped.sin_addr), ntohs(mapped.sin_port));
 
 	return res;
 }
