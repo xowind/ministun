@@ -52,9 +52,15 @@
 #include <time.h>
 #include <errno.h>
 
+#include <linux/ip.h>
+#include <linux/udp.h>
+
 #include "ministun.h"
 
 #undef STUN_BINDREQ_PROCESS
+
+
+#define ENOTRECVING -17
 
 struct stun_strings {
 	const int value;
@@ -228,11 +234,73 @@ static void append_attr_address(struct stun_attr **attr, int attrval, struct soc
 }
 #endif
 
-/* wrapper to send an STUN message */
-static int stun_send(int s, struct sockaddr_in *dst, struct stun_header *resp)
+unsigned short csum(unsigned short *buf, int nwords)
 {
-	return sendto(s, resp, ntohs(resp->msglen) + sizeof(*resp), 0,
-		      (struct sockaddr *)dst, sizeof(*dst));
+	unsigned long sum;
+	for(sum=0; nwords>0; nwords--)
+		sum += *buf++;
+	sum = (sum >> 16) + (sum &0xffff);
+	sum += (sum >> 16);
+	return (unsigned short)(~sum);
+}
+
+/* wrapper to send an STUN message */
+static int stun_send(int s, struct sockaddr_in *cli, struct sockaddr_in *dst, struct stun_header *resp)
+{
+	char buffer[1024];
+	struct iphdr *ip = (struct iphdr *) buffer;
+	struct udphdr *udp = (struct udphdr *) (buffer + sizeof(struct iphdr));
+	int plen = ntohs(resp->msglen) + sizeof(*resp);
+	bzero(&buffer, sizeof(buffer));
+
+	// fabricate the IP header
+	ip->ihl      = 5;
+	ip->version  = 4;
+	ip->tos      = 16; // low delay
+	ip->tot_len  = htons(sizeof(struct iphdr) + sizeof(struct udphdr) + plen);
+	ip->id       = htons(random());
+	ip->ttl      = 64; // hops
+	ip->protocol = 17; // UDP
+	// source IP address, can use spoofed address here
+	ip->saddr = cli->sin_addr.s_addr;
+	ip->daddr = dst->sin_addr.s_addr;
+
+	// fabricate the UDP header
+	udp->source = cli->sin_port;
+	// destination port number
+	udp->dest = dst->sin_port;
+	udp->len = htons(sizeof(struct udphdr) + plen);
+
+	//copy the request
+	memcpy(buffer+(sizeof(struct iphdr)+sizeof(struct udphdr)), resp, plen);
+
+	// calculate the checksum for integrity
+	ip->check = csum((unsigned short *)buffer, sizeof(struct iphdr) + sizeof(struct udphdr) + plen);
+
+	return sendto(s, buffer, ntohs(ip->tot_len), 0, (struct sockaddr *)dst, sizeof(*dst));
+}
+
+/* wrapper to recv an STUN message */
+static int stun_recv(int s, struct sockaddr_in *cli, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen)
+{
+	char buffer[1024];
+	struct iphdr *ip = (struct iphdr *) buffer;
+	struct udphdr *udp = (struct udphdr *) (buffer + sizeof(struct iphdr));
+	int res = ENOTRECVING;
+	bzero(&buffer, sizeof(buffer));
+
+	res = recvfrom(s, buffer, sizeof(buffer) - 1, flags, (struct sockaddr *)src_addr, addrlen);
+	if (res <= 0) {
+		return res;
+	}
+	if (ip->protocol == 17 && udp->dest == cli->sin_port) {
+		if (len > udp->len - sizeof(struct udphdr)) {
+			len = udp->len - sizeof(struct udphdr);
+		}
+		memcpy(buf, buffer+(sizeof(struct iphdr)+sizeof(struct udphdr)), len);
+		return len;
+	}
+	return ENOTRECVING;
 }
 
 /* helper function to generate a random request id */
@@ -408,7 +476,7 @@ static int stun_get_mapped(struct stun_state *st, struct stun_attr *attr, void *
  *    puts here the externally visible address.
  * \return 0 on success, other values on error.
  */
-int stun_request(int s, struct sockaddr_in *dst,
+int stun_request(int s, struct sockaddr_in *cli, struct sockaddr_in *dst,
 	const char *username, struct sockaddr_in *answer)
 {
 	struct stun_header *req;
@@ -441,7 +509,7 @@ int stun_request(int s, struct sockaddr_in *dst,
 		socklen_t srclen;
 
 		do {
-			res = stun_send(s, dst, req);
+			res = stun_send(s, cli, dst, req);
 		} while (res < 0 && errno == EINTR);
 		if (res < 0) {
 			fprintf(stderr, "Request send #%d failed error %d, retry\n",
@@ -470,12 +538,17 @@ int stun_request(int s, struct sockaddr_in *dst,
 		 * write past the end of the buffer.
 		 */
 		do  {
-			res = recvfrom(s, reply_buf, sizeof(reply_buf) - 1,
+			res = stun_recv(s, cli, reply_buf, sizeof(reply_buf) - 1,
 				0, (struct sockaddr *)&src, &srclen);
 		} while (res < 0 && errno == EINTR);
 		if (res <= 0) {
-			fprintf(stderr, "Response read #%d failed error %d, retry\n",
+			if (res == ENOTRECVING) {
+				fprintf(stderr, "Response read #%d ignore, retry\n", retry);
+				retry--;
+			} else {
+				fprintf(stderr, "Response read #%d failed error %d, retry\n",
 				retry, res);
+			}
 			continue;
 		}
 		bzero(answer, sizeof(struct sockaddr_in));
@@ -497,6 +570,8 @@ int main(int argc, char *argv[])
 	struct sockaddr_in server,client,mapped;
 	struct hostent *hostinfo;
 	char *value;
+	int one = 1;
+	const int *val = &one;
 
 	while ((opt = getopt(argc, argv, "t:c:l:p:dh")) != -1) {
 		switch (opt) {
@@ -529,18 +604,29 @@ int main(int argc, char *argv[])
 			stun_port = atoi(value);
 	}
 
-	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	sock = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
 	if (sock < 0) {
 		fprintf(stderr, "Error creating socket\n");
+		return -1;
+	}
+
+	// inform the kernel do not fill up the packet structure, we will build our own
+	if(setsockopt(sock, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0) {
+		fprintf(stderr, "setsockopt() error\n");
 		return -1;
 	}
 
 	bzero(&client, sizeof(client));
 	client.sin_family = AF_INET;
 	client.sin_port = htons(stun_listen_port);
-	if (inet_aton(stun_local, &client.sin_addr) == 0 ||
+	/*if (inet_aton(stun_local, &client.sin_addr) == 0 ||
 	    bind(sock, (struct sockaddr*) &client, sizeof(client)) < 0) {
 		fprintf(stderr, "Error bind to socket\n");
+		close(sock);
+		return -1;
+	}*/
+	if (inet_aton(stun_local, &client.sin_addr) == 0 ) {
+		fprintf(stderr, "Error of client addr\n");
 		close(sock);
 		return -1;
 	}
@@ -556,7 +642,7 @@ int main(int argc, char *argv[])
 	server.sin_addr = *(struct in_addr*) hostinfo->h_addr;
 	server.sin_port = htons(stun_port);
 
-	res = stun_request(sock, &server, NULL, &mapped);
+	res = stun_request(sock, &client, &server, NULL, &mapped);
 	close(sock);
 
 	if (res == 0 && mapped.sin_addr.s_addr == INADDR_ANY)
